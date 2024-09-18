@@ -1,0 +1,67 @@
+function Get-GoogleUsersWithAlias {
+    [cmdletbinding()]
+    Param (
+        [object]$authorization
+    )
+    Process {
+        $allUsersWithAliases = @()
+        $nextPageToken = $null
+
+        do {
+            # Construct the API request URI with pagination
+            $uri = "https://www.googleapis.com/admin/directory/v1/users?customer=my_customer&projection=full"
+            if ($nextPageToken) {
+                $uri += "&pageToken=$nextPageToken"
+            }
+
+            $splat = @{
+                Uri     = $uri
+                Method  = 'GET'
+                Headers = $authorization
+                Verbose = $False
+            }
+
+            # Send the request and retrieve users
+            $correlationResponse = Invoke-RestMethod @splat
+
+            # Filter and collect users with aliases
+            $usersWithAliases = $correlationResponse.users | Where-Object { $_.aliases -ne $null }
+            $allUsersWithAliases += $usersWithAliases
+
+            # Update the nextPageToken for the next iteration
+            $nextPageToken = $correlationResponse.nextPageToken
+        } while ($nextPageToken)
+
+        return $allUsersWithAliases
+    }
+}
+
+function Delete-UserAlias {
+    [cmdletbinding()]
+    Param (
+        [string]$userKey,          # The primary email or unique ID of the user
+        [string]$alias,            # The alias to delete
+        [object]$authorization     # Authorization header
+    )
+    Process {
+        # Construct the API request URI for deleting the alias
+        $uri = "https://www.googleapis.com/admin/directory/v1/users/$userKey/aliases/$alias"
+
+        # Define the parameters for the API request
+        $splat = @{
+            Uri         = $uri
+            Method      = 'DELETE'
+            Headers     = $authorization
+            Verbose     = $False
+        }
+
+        # Send the request to delete the alias
+        try {
+            $response = Invoke-RestMethod @splat
+            Write-Output "Alias '$alias' deleted for user: $userKey"
+            return $response
+        } catch {
+            Write-Error "Failed to delete alias '$alias' for user: $userKey. Error: $_"
+        }
+    }
+}
