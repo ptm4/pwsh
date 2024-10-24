@@ -1,0 +1,340 @@
+$c = $configuration | ConvertFrom-Json
+$p = $person | ConvertFrom-Json
+$pp = $previousPerson | ConvertFrom-Json
+$pd = $personDifferences | ConvertFrom-Json
+$m = $manager | ConvertFrom-Json
+$aRef = $accountReference | ConvertFrom-Json
+$mRef = $managerAccountReference | ConvertFrom-Json
+$success = $false
+$auditLogs = [Collections.Generic.List[PSCustomObject]]::new()
+
+# Set TLS to accept TLS, TLS 1.1 and TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
+
+# Set debug logging
+switch ($($c.isDebug)) {
+    $true { $VerbosePreference = 'Continue' }
+    $false { $VerbosePreference = 'SilentlyContinue' }
+}
+$InformationPreference = "Continue"
+$WarningPreference = "Continue"
+
+# Used to connect to Azure AD Graph API
+$AADtenantID = $c.AADtenantID
+$AADAppId = $c.AADAppId
+$AADAppSecret = $c.AADAppSecret
+
+# Use dummy reference for previews
+if($dryRun -eq $true -and $aRef -eq $null){
+    $aRef = "Test-Reference"
+}
+
+#region functions
+
+# Generate Azure AD Authorization Headers
+function New-AuthorizationHeaders {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.Dictionary[[String], [String]]])]
+    param(
+        [parameter(Mandatory)]
+        [string]
+        $TenantId,
+
+        [parameter(Mandatory)]
+        [string]
+        $ClientId,
+
+        [parameter(Mandatory)]
+        [string]
+        $ClientSecret
+    )
+    try {
+        Write-Verbose "Creating Access Token"
+        $baseUri = "https://login.microsoftonline.com/"
+        $authUri = $baseUri + "$TenantId/oauth2/token"
+    
+        $body = @{
+            grant_type    = "client_credentials"
+            client_id     = "$ClientId"
+            client_secret = "$ClientSecret"
+            resource      = "https://graph.microsoft.com"
+        }
+    
+        $Response = Invoke-RestMethod -Method POST -Uri $authUri -Body $body -ContentType 'application/x-www-form-urlencoded'
+        $accessToken = $Response.access_token
+    
+        #Add the authorization header to the request
+        Write-Verbose 'Adding Authorization headers'
+
+        $headers = [System.Collections.Generic.Dictionary[[String], [String]]]::new()
+        $headers.Add('Authorization', "Bearer $accesstoken")
+        $headers.Add('Accept', 'application/json')
+        $headers.Add('Content-Type', 'application/json')
+        # Needed to filter on specific attributes (https://docs.microsoft.com/en-us/graph/aad-advanced-queries)
+        $headers.Add('ConsistencyLevel', 'eventual')
+
+        Write-Output $headers  
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
+
+# Resolve General HTTP Errors
+function Resolve-HTTPError {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory,
+            ValueFromPipeline
+        )]
+        [object]$ErrorObject
+    )
+    process {
+        $httpErrorObj = [PSCustomObject]@{
+            FullyQualifiedErrorId = $ErrorObject.FullyQualifiedErrorId
+            MyCommand             = $ErrorObject.InvocationInfo.MyCommand
+            RequestUri            = $ErrorObject.TargetObject.RequestUri
+            ScriptStackTrace      = $ErrorObject.ScriptStackTrace
+            ErrorMessage          = ''
+        }
+        if ($ErrorObject.Exception.GetType().FullName -eq 'Microsoft.PowerShell.Commands.HttpResponseException') {
+            $httpErrorObj.ErrorMessage = $ErrorObject.ErrorDetails.Message
+        }
+        elseif ($ErrorObject.Exception.GetType().FullName -eq 'System.Net.WebException') {
+            $httpErrorObj.ErrorMessage = [System.IO.StreamReader]::new($ErrorObject.Exception.Response.GetResponseStream()).ReadToEnd()
+        }
+        Write-Output $httpErrorObj
+    }
+}
+
+# Resolve Azure-Specific HTTP Errors
+function Resolve-MicrosoftGraphAPIErrorMessage {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory,
+            ValueFromPipeline
+        )]
+        [object]$ErrorObject
+    )
+    process {
+        try {
+            $errorObjectConverted = $ErrorObject | ConvertFrom-Json -ErrorAction Stop
+
+            if ($null -ne $errorObjectConverted.error_description) {
+                $errorMessage = $errorObjectConverted.error_description
+            }
+            elseif ($null -ne $errorObjectConverted.error) {
+                if ($null -ne $errorObjectConverted.error.message) {
+                    $errorMessage = $errorObjectConverted.error.message
+                    if ($null -ne $errorObjectConverted.error.code) { 
+                        $errorMessage = $errorMessage + " Error code: $($errorObjectConverted.error.code)"
+                    }
+                }
+                else {
+                    $errorMessage = $errorObjectConverted.error
+                }
+            }
+            else {
+                $errorMessage = $ErrorObject
+            }
+        }
+        catch {
+            $errorMessage = $ErrorObject
+        }
+
+        Write-Output $errorMessage
+    }
+}
+
+function Get-LatestContractProperty {
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$contracts,
+
+        [Parameter(Mandatory = $true)]
+        [string]$propertyPath
+    )
+
+    # Initialize variables
+    $latestStartDate = [datetime]::MinValue
+    $latestContract = $null
+    $today = [datetime]::Today
+    $i = 0
+
+    # Loop through contracts to find the latest start date with non-null property value and no EndDate
+    foreach ($contract in $contracts) {
+        $startDate = if ($contract.StartDate) { [datetime]::Parse($contract.StartDate) } else { [datetime]::MinValue }
+        $endDate = if ($contract.EndDate) { [datetime]::Parse($contract.EndDate) } else { [datetime]::MinValue }
+
+        # Check conditions: Latest start date, non-null property value, no EndDate, and startDate is not in the future
+        if ($startDate -le $today -and $startDate -gt $latestStartDate -and
+            -not [string]::IsNullOrEmpty($contract.Custom.$propertyPath) -and
+            ([string]::IsNullOrEmpty($contract.EndDate) -or $endDate -gt $today)) {
+
+            $latestStartDate = $startDate
+            $latestContract = $contract
+        }
+    }
+
+    # Return the property value from the latest contract if found
+    if ($latestContract -ne $null) {
+        return $latestContract.Custom.$propertyPath
+    } else {
+        return $null
+    }
+}
+
+
+$department = Get-LatestContractProperty -contracts $p.Contracts -propertyPath "department"
+$location = Get-LatestContractProperty -contracts $p.Contracts -propertyPath "location"
+$jobTitle = Get-LatestContractProperty -contracts $p.Contracts -propertyPath "title"
+
+<#
+#department
+$i = 0
+$department = $p.Contracts[0].Custom.department
+do {
+    if ([string]::IsNullOrEmpty($department)) {
+        $department = $p.Contracts[$i].Custom.department
+        $i++
+    }
+} while ([string]::IsNullOrEmpty($department) -and $i -lt 20)
+#jobTitle
+$i = 0
+$jobTitle = $p.Contracts[0].Custom.title
+do {
+    if ([string]::IsNullOrEmpty($jobTitle)) {
+        $jobTitle = $p.Contracts[$i].Custom.title
+        $i++
+    }
+} while ([string]::IsNullOrEmpty($jobTitle) -and $i -lt 20)
+#location
+$i = 0
+$location = $p.Contracts[0].Custom.location
+do {
+    if ([string]::IsNullOrEmpty($location)) {
+        $location = $p.Contracts[$i].Custom.location
+        $i++
+    }
+} while ([string]::IsNullOrEmpty($location) -and $i -lt 20)
+#>
+#endregion functions
+try {
+    # GET CURRENT AZURE AD ACCOUNT USING ACCOUNT OBJECT ID
+
+    # Generate Azure Headers
+    $headers = New-AuthorizationHeaders -TenantId $AADtenantID -ClientId $AADAppId -ClientSecret $AADAppSecret
+    
+    # Build request
+    $baseUri = "https://graph.microsoft.com/"
+    $splatWebRequest = @{
+        Uri     = "$baseUri/v1.0/users/$($aRef)" + '?$select=id,displayName,givenName,surname,mail,userPrincipalName,onPremisesSyncEnabled'
+        Headers = $headers
+        Method  = 'GET'
+    }
+    
+    # Fetch user
+    $currentAccount = Invoke-RestMethod @splatWebRequest -Verbose:$false
+    
+    # Get ID/UPN/Sync Status of current account
+    $accountID = $currentAccount.id; 
+    $accountUPN = $account.userPrincipalName; 
+    $accountSyncStatus = $currentAccount.onPremisesSyncEnabled;
+
+    # Get First/Last Name
+    $firstName = $p.Name.NickName;
+    $lastName = if([string]::IsNullOrEmpty($p.Custom.lastName)) { $p.Name.FamilyName + " " + $p.Name.FamilyNamePartner} else { $p.Custom.lastName };
+    $fullLastName = $p.Custom.fullLastName
+    # Prepare fields for new account
+    $accountFields = [PSCustomObject]@{
+        givenName = $firstName
+        surname = $fullLastName
+        displayName = "$($firstName) $($fullLastName)"
+        companyName = "Seaford UFSD"
+        department = $department
+        officeLocation = $location
+        jobTitle = $jobTitle
+    }
+
+    # Log Azure Fields that are being updated
+    $accountFields.PSObject.Properties | ForEach-Object {
+        Write-Information "$($_.Name) - $($_.Value)"; 
+    }
+
+    # Update Azure AD Account
+
+    # Update account ONLY if it isn't being synced from on-prem 
+    # (graph API won't allow it)
+    if($accountSyncStatus -ne $true){
+        if(-Not($dryRun -eq $true)){
+            $splatUpdateWebRequest = @{
+                Uri     = "https://graph.microsoft.com/v1.0/users/$($aRef)"
+                Method  = 'PATCH'
+                Body    = $accountFields | ConvertTo-Json -Depth 10
+                Verbose = $false
+                Headers = $headers
+            }
+
+            $response = Invoke-RestMethod @splatUpdateWebRequest;
+        }
+
+        $auditLogs.Add([PSCustomObject]@{
+            Action  = "UpdateAccount"
+            Message = "Successfully updated Azure AD account: [$($aRef)]"
+            IsError = $false
+        })
+    }else{
+        $auditLogs.Add([PSCustomObject]@{
+            Action  = "UpdateAccount"
+            Message = "Not updating Azure AD account: [$($aRef)]. It is being synced from on-prem AD and cannot be touched here."
+            IsError = $false
+        })
+    }
+}catch{
+    # Clean up error variables
+    $verboseErrorMessage = $null
+    $auditErrorMessage = $null
+
+    $ex = $PSItem
+    if ( $($ex.Exception.GetType().FullName -eq 'Microsoft.PowerShell.Commands.HttpResponseException') -or $($ex.Exception.GetType().FullName -eq 'System.Net.WebException')) {
+        $errorObject = Resolve-HTTPError -Error $ex
+
+        $verboseErrorMessage = $errorObject.ErrorMessage
+
+        $auditErrorMessage = Resolve-MicrosoftGraphAPIErrorMessage -ErrorObject $errorObject.ErrorMessage
+    }
+
+    # If error message empty, fall back on $ex.Exception.Message
+    if ([String]::IsNullOrEmpty($verboseErrorMessage)) {
+        $verboseErrorMessage = $ex.Exception.Message
+    }
+    if ([String]::IsNullOrEmpty($auditErrorMessage)) {
+        $auditErrorMessage = $ex.Exception.Message
+    }
+
+    Write-Verbose -verbose "Error at Line '$($ex.InvocationInfo.ScriptLineNumber)': $($ex.InvocationInfo.Line). Error: $($verboseErrorMessage)"
+
+    $auditLogs.Add([PSCustomObject]@{
+        Action  = "UpdateAccount"
+        Message = "Error updating Azure AD account with ID: [$($aRef)]. Error Message: $auditErrorMessage"
+        IsError = $True
+    })
+}finally{
+    # Check if auditLogs contains errors, if no errors are found, set success to true
+    if (-NOT($auditLogs.IsError -contains $true)) {
+        $success = $true
+    }
+
+    # Send results
+    $result = [PSCustomObject]@{
+        Success          = $success
+        AuditLogs        = $auditLogs
+        ExportData       = [PSCustomObject]@{
+            #Email = $account.UPN
+            department = $accountFields.department
+            title = $accountFields.jobTitle
+        }
+    }
+
+    Write-Output ($result | ConvertTo-Json -Depth 10)
+}
