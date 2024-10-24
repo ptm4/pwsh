@@ -1,0 +1,370 @@
+$config = $configuration | ConvertFrom-Json;
+$p = $person | ConvertFrom-Json;
+$pp = $previousPerson | ConvertFrom-Json
+$pd = $personDifferences | ConvertFrom-Json
+$m = $manager | ConvertFrom-Json;
+$aRef = $accountReference | ConvertFrom-Json;
+$mRef = $managerAccountReference | ConvertFrom-Json;
+$success = $False;
+$auditLogs = New-Object Collections.Generic.List[PSCustomObject];
+
+# Generate Azure AD Token
+function Get-AzureAccessToken() {
+    # GENERATE GRAPH API ACCESS TOKEN
+    Write-Verbose -Verbose "Generating Microsoft Graph API Access Token.."
+
+    $AADtenantID = $config.AADtenantID
+    $AADAppId = $config.AADAppId
+    $AADAppSecret = $config.AADAppSecret
+
+    # Build request for token-generating endpoint
+    $baseAuthUri = "https://login.microsoftonline.com/"
+    $authUri = $baseAuthUri + "$($AADTenantID)/oauth2/token"
+
+    $body = @{
+        grant_type      = "client_credentials"
+        client_id       = "$($AADAppId)"
+        client_secret   = "$($AADAppSecret)"
+        resource        = "https://graph.microsoft.com"
+    }
+
+    # Fetch token
+    $Response = Invoke-RestMethod -Method POST -Uri $authUri -Body $body -ContentType 'application/x-www-form-urlencoded'
+    $accessToken = $Response.access_token
+
+    # Add the token for future requests
+    $authorization = @{
+        Authorization = "Bearer $accesstoken"
+        'Content-Type' = "application/json"
+        Accept = "application/json"
+    }
+    
+    $authorization
+}
+
+function Get-GoogleAccessToken() {
+    ### exchange the refresh token for an access token
+    $requestUri = "https://www.googleapis.com/oauth2/v4/token"
+
+    $refreshTokenParams = @{
+            client_id=$config.clientId;
+            client_secret=$config.clientSecret;
+            redirect_uri=$config.redirectUri;
+            refresh_token=$config.refreshToken;
+            grant_type="refresh_token"; # Fixed value
+    };
+
+    $response = Invoke-RestMethod -Method Post -Uri $requestUri -Body $refreshTokenParams -Verbose:$false
+    $accessToken = $response.access_token
+
+    #Add the authorization header to the request
+    $authorization = [ordered]@{
+        Authorization = "Bearer $accesstoken";
+        'Content-Type' = "application/json; charset=utf-8";
+        Accept = "application/json";
+    }
+    $authorization
+}
+
+# Sanitization function for names
+function get-sanitizedUTF8Input{
+    Param(
+        [String]$inputString
+    )
+    $replaceTable = @{"ß"="ss";"à"="a";"á"="a";"â"="a";"ã"="a";"ä"="a";"å"="a";"æ"="ae";"ç"="c";"ć"="c";"è"="e";"é"="e";"ê"="e";"ë"="e";"ì"="i";"í"="i";"î"="i";"ï"="i";"ð"="d";"ñ"="n";"ò"="o";"ó"="o";"ô"="o";"õ"="o";"ö"="o";"ø"="o";"ṡ"="s";"ṣ"="s";"ṥ"="s";"ṧ"="s";"ṩ"="s";"š"="s";"ù"="u";"ú"="u";"û"="u";"ü"="u";"ý"="y";"þ"="p";"ÿ"="y";"z"="ž"}
+
+    foreach($key in $replaceTable.Keys){
+        $inputString = $inputString -Replace($key,$replaceTable.$key)
+    }
+    $inputString = $inputString -replace '[^a-zA-Z]', ''
+    $inputString = $inputString -replace '-',''
+    $inputString = $inputString -replace "'",""
+    return $inputString
+}
+
+# Generate Azure AD Nickname (Username)
+#
+# Nickname Format: [firstInitial][lastName][Iterative Suffix (02..03..)]
+# Mail/UPN Format: nickname@[domain]
+function Generate-Username($Iteration)
+{
+    # Generate max length/suffix
+    
+    $maxAttributeLength = 64; 
+    $suffix = ""; 
+
+    if($Iteration -gt 0){
+        $newIteration = $Iteration; 
+        $newIteration = $newIteration.ToString(); 
+        $suffix = $newIteration; 
+    }
+    $maxAttributeLength = $maxAttributeLength - ($suffix.Length); 
+    
+    # Get Clean First Name
+    $firstName = $p.Name.NickName;
+    $firstName = get-sanitizedUTF8Input -inputString $firstName;
+
+    # Get First Initial
+    $firstInitial = $firstName.substring(0, 1); 
+	
+    # Get Clean Last Name
+    $lastName = $p.Name.FamilyName;
+    $lastName = get-sanitizedUTF8Input -inputString $lastName;
+
+    # Combine First Initial and Last Name
+	$username = $firstInitial + $lastName;
+
+	# Convert To Lower Case
+	$username = $username.toLower(); 
+
+    # Restrict username to max characters 
+	if($username.Length -gt $maxAttributeLength)
+	{
+		$username = $username.substring(0,$maxAttributeLength)
+	}
+	
+    # Add suffix
+	$username = $username + $suffix;
+
+    $username;
+}
+
+# Retrieve current account data for properties to be updated
+$previousNameAccount = [PSCustomObject]@{
+    FirstName= $pp.Name.NickName;
+    LastName= $pp.Name.FamilyName;
+};
+
+# Map the properties to update
+$nameAccount = [PSCustomObject]@{
+    FirstName= $p.Name.NickName;
+    LastName= $p.Name.FamilyName;
+};
+
+if(
+    ($pp.Name.FamilyName -ne $Null -and $pp.Name.FamilyName -ne "") -or 
+    ($pp.Name.NickName -ne $Null -and $pp.Name.NickName -ne "")
+){
+    
+	if(
+        ($pp.Name.NickName -ne $p.Name.NickName) -or 
+        ($pp.Name.FamilyName -ne $p.Name.FamilyName)
+    ){
+        # Fetch Azure Account
+
+        # Get authorization header with Azure access token
+        $authorization = Get-AzureAccessToken
+
+        # FETCH CURRENT ACCOUNT
+
+        # Build request to fetch user
+        $baseGraphUri = "https://graph.microsoft.com/"
+        $searchUri = $baseGraphUri + "v1.0/users?`$select=id,mailNickName,mail,userPrincipalName,onPremisesSyncEnabled&`$filter=employeeID eq '$($p.ExternalId)'"
+
+        # Fetch user
+        $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $authorization -Verbose:$true
+        $account = $response.value
+
+        # Get Azure Account ID (for logging)
+        $accountID = $account.id; 
+
+        # Get Sync Status
+        $accountSyncStatus = $account.onPremisesSyncEnabled; 
+        
+        # Attempt A Name Change
+        # (only if they're not being synced from on-prem)
+        if($accountSyncStatus -ne $true){
+
+            $auditLogs.Add([PSCustomObject]@{
+                Action  = "UpdateAccount"
+                Message = "Azure AD account: [$($accountID)] isn't synced from on-prem. A name change may be attempted."
+                IsError = $false
+            })
+
+            # Store current account attributes
+            $oldMailNickName = $account.mailNickName;
+            $oldMail = $account.mail;
+            $oldUPN = $account.userPrincipalName;
+            
+            $notUnique = $True;
+            $noChange = $False;
+            $Iteration = 0;
+        
+            do
+            {
+                # Log error for max iteration
+                if($Iteration -ge 10){ 
+                    $auditLogs.Add([PSCustomObject]@{
+                        Action = "UpdateAccount"
+                        Message = "Max Username Iteration Exceeded For New Username Generation"
+                        IsError = $true;
+                    });
+                    break;
+                }
+
+                # Generate new attributes
+
+                $nickName = Generate-Username($Iteration);
+                $mail = "$($nickName)@$($config.azureDomain)";
+                $upn = "$($nickName)@$($config.azureDomain)"; 
+
+                # Check Account Identifiers Against Azure AD
+
+                # Check mailNickname Field
+
+                $searchUri = $baseGraphUri + "v1.0/users?`$filter=mailNickname eq '$($nickname)'"
+                $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $authorization -Verbose:$false
+                $duplicateNicknameCount = $response.value.Length;
+
+                # Check mail Field
+
+                $searchUri = $baseGraphUri + "v1.0/users?`$filter=mail eq '$($mail)'"
+                $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $authorization -Verbose:$false
+                $duplicateMailCount = $response.value.Length;
+
+                # Check userPrincipalName Field
+
+                $searchUri = $baseGraphUri + "v1.0/users?`$filter=userPrincipalName eq '$($mail)'"
+                $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $authorization -Verbose:$false
+                $duplicateUPNCount = $response.value.Length;
+
+                # Check proxyAddresses Field
+
+                $searchUri = $baseGraphUri + "v1.0/users?`$filter=proxyAddresses/any(p:p eq 'smtp:$($mail)')"
+                $response = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $authorization -Verbose:$false
+                $duplicateProxiesCount = $response.value.Length;
+            
+                # Compare using a count of conflicts
+                $conflictCount = $duplicateNicknameCount + $duplicateMailCount + $duplicateUPNCount + $duplicateProxiesCount;
+                
+                if(($conflictCount -eq 0)){
+                    $notUnique = $False;
+                    Write-Information ("Mail Nick Name: $nickName");
+                    Write-Information ("User Principal Name: $upn");
+                    Write-Information ("Mail: $mail");
+                }elseif(
+                    ($oldMailNickName -eq $nickName) -and 
+                    ($oldUPN -eq $upn) -and 
+                    ($oldMail -eq $mail)
+                ){
+                    $notUnique = $False;
+                    $noChange = $True;
+                    Write-Information ("No username change required.");
+                }
+                else
+                {
+                    $Iteration = $Iteration + 1;
+                    Write-Information "$($nickName) already in use, iterating";
+                }
+            
+            }while($notUnique)
+            
+
+            if(-Not($dryRun -eq $True) -and -Not($noChange -eq $True))
+            {
+                try{
+                    # Create request URL
+                    $Uri = $baseGraphUri + "v1.0/users/$($accountID)"
+
+                    # Create body (include new account identifiers)
+                    $body = @{ 
+                        "mailNickName"= $nickName; 
+                        "userPrincipalName"= $upn;
+                        "mail"= $mail; 
+                    }
+                    
+                    # Create request URL
+                    $Uri = $baseGraphUri + "v1.0/users/$($accountID)"
+
+                    # Create body (include new account identifiers)
+                    $body = @{ 
+                        "mailNickName"= $nickName; 
+                        "userPrincipalName"= $upn;
+                        "mail"= $mail; 
+                    }
+
+                    $auditLogs.Add([PSCustomObject]@{
+                        Action = "UpdateAccount"
+                        Message = "New username generated. Updating nickname to $($body.mailNickName)"
+                        IsError = $false;
+                    });
+
+                    # Update account
+                    $response = Invoke-RestMethod -Uri $Uri -Method PATCH -Headers $authorization -Body ($body | ConvertTo-Json)
+
+                    $auditLogs.Add([PSCustomObject]@{
+                        Action = "UpdateAccount"
+                        Message = "Account identifiers updated successfully."
+                        IsError = $false;
+                    });
+
+                    # Update Google Account
+                    $account = [PSCustomObject]@{
+                        primaryEmail = $mail  
+                    }
+
+                    #Add the authorization header to the request
+                    $authorization = Get-GoogleAccessToken
+                    $oldGmail = $account.mail
+
+                    if(-Not($dryRun -eq $True)){
+                        # Get Previous Account
+                        $splat = @{
+                            Uri = "https://www.googleapis.com/admin/directory/v1/users/$($oldMail)"
+                            Method = 'GET'
+                            Headers = $authorization
+                            Verbose = $False
+                        }
+                        $previousAccount = Invoke-RestMethod @splat
+
+                        $splat = @{
+                            Uri = "https://www.googleapis.com/admin/directory/v1/users/$($oldMail)"
+                            Method = 'PUT'
+                            Headers = $authorization
+                            Body = [System.Text.Encoding]::UTF8.GetBytes(($account | ConvertTo-Json -Depth 10))
+                            Verbose = $False
+                        }
+                        $updatedAccount = Invoke-RestMethod @splat
+
+
+                        #Write-Information ("Updated Account: {0}" -f ($updatedAccount | ConvertTo-Json -Depth 10))
+                        $auditLogs.Add([PSCustomObject]@{
+                            Action = "UpdateAccount"
+                            Message = "Updated account with PrimaryEmail $($updatedAccount.primaryEmail) in OrgUnit [$($account.orgUnitPath)]"
+                            IsError = $false;
+                        });
+                    }
+                    
+                }catch{
+                    $auditLogs.Add([PSCustomObject]@{
+                        Action = "UpdateAccount"
+                        Message = "Error updating account - Error: $($_)"
+                        IsError = $true;
+                    });
+                    Write-Error $_
+                }
+            }
+        }else{
+            $auditLogs.Add([PSCustomObject]@{
+                Action  = "UpdateAccount"
+                Message = "Not attempting name change against Azure AD account (ID): [$($accountID)]. It is being synced from on-prem AD and cannot be touched here."
+                IsError = $false
+            })
+        }
+	}
+}
+
+# Check if auditLogs contains errors, if no errors are found, set success to true
+if (-NOT($auditLogs.IsError -contains $true)) {
+    $success = $true
+}
+
+# Send results
+$result = [PSCustomObject]@{
+	Success= $success;
+	AuditLogs = $auditLogs;
+    Account = $nameAccount;
+    PreviousAccount = $previousNameAccount;
+};
+
+Write-Output $result | ConvertTo-Json -Depth 10;
