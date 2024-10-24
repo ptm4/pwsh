@@ -1,0 +1,258 @@
+$config = $configuration | ConvertFrom-Json;
+$p = $person | ConvertFrom-Json;
+$pp = $previousPerson | ConvertFrom-Json
+$pd = $personDifferences | ConvertFrom-Json
+$m = $manager | ConvertFrom-Json;
+$aRef = $accountReference | ConvertFrom-Json;
+$mRef = $managerAccountReference | ConvertFrom-Json;
+$success = $False;
+$auditLogs = New-Object Collections.Generic.List[PSCustomObject];
+
+function Get-GoogleAccessToken() {
+    ### exchange the refresh token for an access token
+    $requestUri = "https://www.googleapis.com/oauth2/v4/token"
+
+    $refreshTokenParams = @{
+            client_id=$config.clientId;
+            client_secret=$config.clientSecret;
+            redirect_uri=$config.redirectUri;
+            refresh_token=$config.refreshToken;
+            grant_type="refresh_token"; # Fixed value
+    };
+    
+    $response = Invoke-RestMethod -Method Post -Uri $requestUri -Body $refreshTokenParams -Verbose:$false
+    $accessToken = $response.access_token
+    
+    #Add the authorization header to the request
+    $authorization = [ordered]@{
+        Authorization = "Bearer $($accesstoken)";
+        'Content-Type' = "application/json; charset=utf-8";
+        Accept = "application/json";
+    }
+    $authorization
+}
+
+function get-sanitizedUTF8Input{
+    Param(
+        [String]$inputString
+    )
+    $replaceTable = @{"ß"="ss";"à"="a";"á"="a";"â"="a";"ã"="a";"ä"="a";"å"="a";"æ"="ae";"ç"="c";"è"="e";"é"="e";"ê"="e";"ë"="e";"ì"="i";"í"="i";"î"="i";"ï"="i";"ð"="d";"ñ"="n";"ò"="o";"ó"="o";"ô"="o";"õ"="o";"ö"="o";"ø"="o";"ù"="u";"ú"="u";"û"="u";"ü"="u";"ý"="y";"þ"="p";"ÿ"="y"}
+
+    foreach($key in $replaceTable.Keys){
+        $inputString = $inputString -Replace($key,$replaceTable.$key)
+    }
+    $inputString = $inputString -replace '[^a-zA-Z0-9]', ''
+    return $inputString
+}
+
+function Generate-Username($Iteration)
+{
+
+    $suffix = '';
+    if($Iteration -gt 0){$suffix = $Iteration + 1;}
+
+    $firstName = $p.Name.NickName;
+    $middleName = $p.Custom.middleName.substring(0,1);
+	$lastName = $p.Name.FamilyName;
+    $firstName = get-sanitizedUTF8Input -inputString $firstName;
+    $lastName = get-sanitizedUTF8Input -inputString $lastName;
+
+	$username = $firstName;
+    if($suffix -ne $null -and $suffix -ne ''){$username = $username + '.' + $middleName}
+	$username = $username + '.' + $lastName;
+
+	#Remove blank chars
+	$username = $username -replace "/\s/g","";
+
+	#Convert to lower case
+	$username = $username.toLower();
+
+	if($username -gt 20)
+	{
+		$username = $username.substring(0,20)
+	}
+	
+	$username;
+}
+
+# Retrieve current account data for properties to be updated
+$previousAccount = [PSCustomObject]@{
+    firstName= $p.Name.NickName;
+    lastName= $p.Name.FamilyName;
+};
+
+# Map the properties to update
+$nameAccount = [PSCustomObject]@{
+    firstName= $p.Name.NickName;
+    lastName= $p.Name.FamilyName;
+};
+
+if(($pp.Name.FamilyName -ne $Null -and $pp.Name.FamilyName -ne "") -or ($pp.Name.NickName -ne $Null -and $pp.Name.NickName -ne ""))
+{
+	if(($pp.Name.NickName -ne $p.Name.NickName) -or ($pp.Name.FamilyName -ne $p.Name.FamilyName))
+	{
+	    $ADAccount = Get-ADUser -LDAPFilter "(employeeID= $($p.externalId))";
+	    $oldUsername = $ADAccount.sAMAccountName;
+        $oldEmail = $ADAccount.userPrincipalName;
+	    $notUnique = $True;
+	    $noChange = $False;
+	    $Iteration = 0;
+	
+	    do
+	    {
+	        $username = Generate-Username($Iteration);
+	        $mail = "$($username)@colquitt.k12.ga.us";
+		
+	        $ADusername = Get-ADUser -LDAPFilter "(sAMAccountName= $username)";
+	        $ADmail = Get-ADUser -LDAPFilter "(mail= $mail)";
+        	$ADupn = Get-ADUser -LDAPFilter "(userPrincipalName= $mail)";
+		
+	        if(($ADusername -eq $Null) -and ($ADupn -eq $Null) -and ($ADmail -eq $Null))
+	        {
+	            $notUnique = $False;
+	            Write-Information ("sAMAccountName: $($username)");
+	            Write-Information ("userPrincipalName: $($mail)");
+	            Write-Information ("Email: $($mail)");
+	        }
+	        elseif(($ADAccount.sAMAccountName -eq $username) -and ($ADAccount.userPrincipalName -eq $mail))
+	        {
+	            $notUnique = $False;
+	            $noChange = $True;
+	            Write-Information ("No username change required.");
+	        }
+	        else
+	        {
+	            $Iteration = $Iteration + 1;
+	            Write-Information "$($username) already in use, iterating";
+	        }
+	    }while($notUnique)
+	
+	    if(-Not($dryRun -eq $True) -and -Not($noChange -eq $True) -AND (1 -eq 2))
+        {
+	        #Update AD
+	        $Proxy = @("SMTP: $($mail)",
+	                "smtp: $($oldEmail)");
+	        
+	        Set-ADUser -identity $ADAccount.DistinguishedName -Replace @{"sAMAccountName" = $username; "mail" = $mail; "userPrincipalName" = $mail} -verbose;
+	        Set-ADUser -identity $ADAccount.DistinguishedName -Clear proxyAddresses -verbose;
+	        Set-ADUser -identity $ADAccount.DistinguishedName -Add @{"proxyAddresses" = $Proxy} -verbose;
+	
+	        #Update Google
+	        try
+            {
+                #Add the authorization header to the request
+                $authorization = Get-GoogleAccessToken
+
+                $account = [PSCustomObject]@{
+                    primaryEmail = $mail
+                }
+
+                # Get Previous Account
+                $splat = @{
+                    Uri = "https://www.googleapis.com/admin/directory/v1/users/$($oldEmail)"
+                    Method = 'GET'
+                    Headers = $authorization
+                    Verbose = $False
+                }
+                $previousAccount = Invoke-RestMethod @splat
+
+                $splat = @{
+                    Uri = "https://www.googleapis.com/admin/directory/v1/users/$($oldEmail)"
+                    Method = 'PUT'
+                    Headers = $authorization
+                    Body = [System.Text.Encoding]::UTF8.GetBytes(($account | ConvertTo-Json -Depth 10))
+                    Verbose = $False
+                }
+                $updatedAccount = Invoke-RestMethod @splat
+
+                Write-Information ("Updated Account: {0}" -f ($updatedAccount | ConvertTo-Json -Depth 10))
+                $auditLogs.Add([PSCustomObject]@{
+                    Action = "UpdateAccount"
+                    Message = "Updated account with PrimaryEmail $($updatedAccount.primaryEmail) in OrgUnit [$($account.orgUnitPath)]"
+                    IsError = $false;
+                });
+            }
+	        catch
+            {
+	            $auditLogs.Add([PSCustomObject]@{
+	                Action = "UpdateAccount"
+	                Message = "Error updating account with PrimaryEmail $($account.primaryEmail) - Error: $($_)"
+	                IsError = $true;
+	            });
+	            Write-Error $_
+	        }
+
+            #Attempt rename home directory
+            try
+            {
+                if($p.Custom.type -eq "Staff")
+                {
+                    $type = "Office"
+                }
+                else
+                {
+                    $type = "Teachers"
+                }
+
+                $path = "\\ccfs01\home\$($type)\`$$($account.username)";
+                $FolderExist = test-path -Path $path;
+
+                #Check if homedirectory exist
+                if($FolderExist -eq $true -AND (1 -eq 2))
+                {
+                    $homeDirectory = Rename-Item -Path $account.path -NewName "`$$($username)" -force;
+
+                    $set = Set-ADUser $ADAccount -HomeDrive "H:" -HomeDirectory $path;
+                    
+                    $auditLogs.Add([PSCustomObject]@{
+                        # Action = "UpdateAccount"; Optionally specify a different action for this audit log
+                        Message = "Home Directory $($path) renamed for person $($username)";
+                        IsError = $False;
+                    });
+                    $success = $True;
+                }
+                else
+                {
+                    $set = Set-ADUser $ADAccount -HomeDrive "H:" -HomeDirectory $path;
+                    $auditLogs.Add([PSCustomObject]@{
+                        # Action = "UpdateAccount"; Optionally specify a different action for this audit log
+                        Message = "Home Directory $($path) already exist.";
+                        IsError = $False;
+                    });  
+                    $success = $True;
+                }
+            }
+            catch
+            {
+                $success = $True;
+                $auditLogs.Add([PSCustomObject]@{
+                    # Action = "UpdateAccount"; Optionally specify a different action for this audit log
+                    Message = "Home directory attempted to rename but failed with error: $_";
+                    IsError = $False;
+                });
+            }
+	    }
+	}
+}
+
+$success = $True;
+$auditLogs.Add([PSCustomObject]@{
+    # Action = "UpdateAccount"; Optionally specify a different action for this audit log
+    Message = "Account with username $($userName) updated";
+    IsError = $False;
+});
+
+# Send results
+$result = [PSCustomObject]@{
+	Success= $success;
+	AuditLogs = $auditLogs;
+    Account = $nameAccount;
+    PreviousAccount = $previousAccount;
+
+    # Optionally update the data for use in other systems
+    ExportData = [PSCustomObject]@{
+        firstName = $p.Name.NickName;
+        lastName = $p.Name.FamilyName;
+    };
+};
+Write-Output $result | ConvertTo-Json -Depth 10;
